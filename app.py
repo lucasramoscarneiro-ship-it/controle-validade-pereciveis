@@ -27,50 +27,49 @@ st.set_page_config(
 )
 
 def aplicar_estilo_profissional():
-    """
-    Esconde tudo de Streamlit (menu, header, footer)
-    e ajusta o layout para ficar mais profissional e bom no celular.
-    """
-    st.markdown(
-        """
-        <style>
-        /* Esconde menu "hambúrguer" do Streamlit */
-        #MainMenu {visibility: hidden;}
+    st.markdown("""
+    <style>
 
-        /* Esconde footer "Made with Streamlit" */
-        footer {visibility: hidden;}
+    /* Remove o menu hambúrguer */
+    #MainMenu {visibility: hidden !important;}
 
-        /* Esconde o header padrão (logo, etc.) */
-        header {visibility: hidden;}
+    /* Remove footer "Made with Streamlit" */
+    footer {visibility: hidden !important;}
 
-        /* Ajuste de padding do container principal */
-        .block-container {
-            padding-top: 0.8rem;
-            padding-bottom: 0.8rem;
-            padding-left: 1rem;
-            padding-right: 1rem;
-        }
+    /* Remove header (onde aparece GitHub / Streamlit) */
+    header {visibility: hidden !important;}
 
-        /* Deixar botões mais amigáveis no mobile */
-        button[kind="primary"], button[kind="secondary"] {
-            min-width: 100%;
-        }
+    /* Esconde também divs internas do header */
+    [data-testid="stHeader"] {
+        display: none !important;
+    }
 
-        @media (max-width: 768px) {
-            .block-container {
-                padding-top: 0.5rem;
-                padding-bottom: 0.5rem;
-                padding-left: 0.5rem;
-                padding-right: 0.5rem;
-            }
-            .stMetric {
-                text-align: center;
-            }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    /* Remove a barra inferior do Streamlit Cloud */
+    [data-testid="stToolbar"] {
+        display: none !important;
+    }
+
+    /* Remove botão do GitHub e links extras */
+    [data-testid="stActionButton"] {
+        display: none !important;
+    }
+
+    /* Remove o botão de hover do GitHub no topo */
+    .stAppDeployButton {
+        display: none !important;
+    }
+
+    /* Ajustes gerais de layout */
+    .block-container {
+        padding-top: 1rem;
+        padding-bottom: 1rem;
+        padding-left: 1rem;
+        padding-right: 1rem;
+    }
+
+    </style>
+    """, unsafe_allow_html=True)
+
 
 # =========================================
 # CONEXÃO COM SUPABASE POSTGRES
