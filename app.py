@@ -1,355 +1,385 @@
 import streamlit as st
-import sqlite3
-from datetime import datetime, date
+import psycopg
 import pandas as pd
+from datetime import datetime, date
 from PIL import Image
 from pyzbar.pyzbar import decode
 from fpdf import FPDF
 import io
-import os
-
-# =========================================
-# CONFIGURAÇÃO BÁSICA
-# =========================================
-st.set_page_config(
-    page_title="Controle de Validade",
-    layout="wide",
-    page_icon="🧊"
-)
-
-# Credenciais simples (pode depois buscar do banco ou Supabase)
-USUARIO_PADRAO = "admin"
-SENHA_PADRAO = "1234"
+import plotly.express as px
 
 
 # =========================================
-# FUNÇÕES DE BANCO (SQLite)
+# CONEXÃO COM SUPABASE POSTGRES
 # =========================================
 def get_conn():
-    # Cria / abre o banco local
-    conn = sqlite3.connect("validade.db", check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    cfg = st.secrets["postgres"]
+    return psycopg.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        dbname=cfg["database"],
+        user=cfg["user"],
+        password=cfg["password"],
+        sslmode=cfg["sslmode"],
+    )
 
-def init_db():
+# =========================================
+# LOGIN (USUÁRIO NO BANCO)
+# =========================================
+def validate_login(username, password):
     conn = get_conn()
     cur = conn.cursor()
-
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ean TEXT NOT NULL,
-            batch TEXT NOT NULL,
-            expiry DATE NOT NULL,
-            quantity INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS movements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER NOT NULL,
-            movement_type TEXT NOT NULL,     -- 'in', 'sale', 'adjust', 'expired'
-            quantity INTEGER NOT NULL,       -- sempre positivo
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(product_id) REFERENCES products(id)
-        );
-    """)
-    conn.commit()
+        SELECT id, username
+        FROM validate_user(%s, %s)
+    """, (username, password))
+    
+    result = cur.fetchone()
+    cur.close()
     conn.close()
+    return result
 
+def pagina_login():
+    st.title("🔐 Login")
+
+    with st.form("login_form"):
+        username = st.text_input("Usuário")
+        password = st.text_input("Senha", type="password")
+        ok = st.form_submit_button("Entrar")
+
+    if ok:
+        user = validate_login(username, password)
+        if user:
+            st.session_state["logged"] = True
+            st.session_state["user_id"] = user[0]
+            st.session_state["username"] = user[1]
+
+            # ➜ ir automaticamente para Cadastro
+            st.session_state["page"] = "Cadastro"
+            st.success(f"Bem-vindo, {user[1]}!")
+
+            st.rerun()
+        else:
+            st.error("Usuário ou senha incorretos.")
+
+
+def exigir_login():
+    if not st.session_state.get("logged", False):
+        pagina_login()
+        st.stop()
+
+# =========================================
+# CRUD DE PRODUTOS E MOVIMENTOS
+# =========================================
 def insert_product(ean, batch, expiry, quantity):
     conn = get_conn()
     cur = conn.cursor()
 
     cur.execute("""
         INSERT INTO products (ean, batch, expiry, quantity)
-        VALUES (?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s)
+        RETURNING id;
     """, (ean, batch, expiry, quantity))
-    product_id = cur.lastrowid
+
+    product_id = cur.fetchone()[0]
 
     # movimento de entrada
     cur.execute("""
         INSERT INTO movements (product_id, movement_type, quantity)
-        VALUES (?, 'in', ?)
+        VALUES (%s, 'in', %s)
     """, (product_id, quantity))
 
     conn.commit()
+    cur.close()
     conn.close()
     return product_id
 
+
 def get_products():
     conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM products ORDER BY expiry ASC;", conn)
+    df = pd.read_sql("SELECT * FROM products ORDER BY expiry ASC", conn)
     conn.close()
     return df
+
 
 def update_product_quantity(product_id, new_qty, movement_type=None, diff_qty=0):
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("UPDATE products SET quantity = ? WHERE id = ?", (new_qty, product_id))
+    cur.execute("""
+        UPDATE products
+        SET quantity = %s
+        WHERE id = %s
+    """, (new_qty, product_id))
 
     if movement_type and diff_qty > 0:
         cur.execute("""
             INSERT INTO movements (product_id, movement_type, quantity)
-            VALUES (?, ?, ?)
+            VALUES (%s, %s, %s)
         """, (product_id, movement_type, diff_qty))
 
     conn.commit()
+    cur.close()
     conn.close()
+
 
 def get_movements():
     conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM movements;", conn)
+    df = pd.read_sql("SELECT * FROM movements", conn)
     conn.close()
     return df
+
 
 def calc_summary():
     products = get_products()
     movements = get_movements()
 
-    today = date.today()
-
-    # Estoque total atual (independente de vencimento)
-    total_stock = int(products["quantity"].sum()) if not products.empty else 0
-
-    # Vencidos = quantidade ainda em estoque com data < hoje
+    # Estoque atual = soma das quantidades na tabela de produtos
+    total_stock = 0
     if not products.empty:
-        products["expiry_date"] = pd.to_datetime(products["expiry"]).dt.date
-        total_expired = int(products.loc[products["expiry_date"] < today, "quantity"].sum())
-    else:
-        total_expired = 0
+        total_stock = int(products["quantity"].sum())
 
-    # Vendas = soma dos movimentos type 'sale'
+    # Vendas
+    total_sales = 0
     if not movements.empty:
-        total_sales = int(movements.loc[movements["movement_type"] == "sale", "quantity"].sum())
-    else:
-        total_sales = 0
+        total_sales = int(
+            movements.loc[movements["movement_type"] == "sale", "quantity"].sum()
+        )
+
+    # -------- VENCIDOS --------
+    expired_by_movements = 0   # já baixados como vencidos
+    expired_in_stock = 0       # ainda no estoque, mas com data vencida
+
+    if not movements.empty:
+        expired_by_movements = int(
+            movements.loc[movements["movement_type"] == "expired", "quantity"].sum()
+        )
+
+    if not products.empty:
+        products = products.copy()
+        products["expiry_date"] = pd.to_datetime(products["expiry"]).dt.date
+        hoje = date.today()
+        expired_in_stock = int(
+            products.loc[products["expiry_date"] < hoje, "quantity"].sum()
+        )
+
+    # total vencido = em estoque + já descartado
+    total_expired = expired_by_movements + expired_in_stock
 
     return total_stock, total_sales, total_expired
 
 
+
 # =========================================
-# CÂMERA / LEITURA DE EAN
+# LEITURA DE CÓDIGO DE BARRAS
 # =========================================
 def read_barcode_from_image(image_file):
-    """
-    Recebe um arquivo (st.camera_input / st.file_uploader) e tenta ler o código de barras.
-    Retorna string do EAN ou None.
-    """
     img = Image.open(image_file)
     decoded = decode(img)
     if decoded:
-        # pega o primeiro código encontrado
         return decoded[0].data.decode("utf-8")
     return None
 
 
 # =========================================
-# PDF DO RELATÓRIO
+# GERAR PDF
 # =========================================
 def gerar_pdf_relatorio(df_produtos, total_stock, total_sales, total_expired):
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=15)
-
     pdf.set_font("Arial", "B", 16)
     pdf.cell(0, 10, "Relatório de Validade de Produtos", ln=True, align="C")
 
     pdf.set_font("Arial", "", 12)
-    pdf.cell(0, 8, f"Data de geração: {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=True)
+    pdf.cell(0, 8, f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=True)
+    pdf.ln(5)
 
-    pdf.ln(4)
+    # Resumo
     pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 8, "Resumo:", ln=True)
-    pdf.set_font("Arial", "", 12)
-    pdf.cell(0, 6, f"Estoque atual: {total_stock}", ln=True)
+    pdf.cell(0, 8, "Resumo Geral:", ln=True)
+    pdf.set_font("Arial", "", 11)
+    pdf.cell(0, 6, f"Estoque total: {total_stock}", ln=True)
     pdf.cell(0, 6, f"Quantidade vendida: {total_sales}", ln=True)
-    pdf.cell(0, 6, f"Quantidade vencida (em estoque): {total_expired}", ln=True)
+    pdf.cell(0, 6, f"Quantidade vencida: {total_expired}", ln=True)
 
-    pdf.ln(6)
+    pdf.ln(8)
     pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 8, "Detalhamento por produto:", ln=True)
+    pdf.cell(0, 8, "Itens detalhados:", ln=True)
 
-    pdf.set_font("Arial", "B", 10)
-    pdf.cell(35, 6, "EAN", border=1)
+    # Cabeçalho da tabela
+    pdf.set_font("Arial", "B", 9)
+    pdf.cell(30, 6, "EAN", border=1)
     pdf.cell(25, 6, "Lote", border=1)
-    pdf.cell(30, 6, "Validade", border=1)
-    pdf.cell(20, 6, "Qtde", border=1)
-    pdf.cell(20, 6, "Vencido?", border=1)
+    pdf.cell(25, 6, "Validade", border=1)
+    pdf.cell(20, 6, "Estoque", border=1)
+    pdf.cell(25, 6, "Vendida", border=1)
+    pdf.cell(25, 6, "Vencida", border=1)
     pdf.ln(6)
 
-    pdf.set_font("Arial", "", 10)
-    today = date.today()
+    # Linhas da tabela
+    pdf.set_font("Arial", "", 9)
     for _, row in df_produtos.iterrows():
-        expiry_date = datetime.strptime(row["expiry"], "%Y-%m-%d").date()
-        vencido = "Sim" if expiry_date < today and row["quantity"] > 0 else "Não"
+        expiry = pd.to_datetime(row["expiry"]).strftime("%d/%m/%Y")
 
-        pdf.cell(35, 6, str(row["ean"])[:15], border=1)
-        pdf.cell(25, 6, str(row["batch"])[:10], border=1)
-        pdf.cell(30, 6, expiry_date.strftime("%d/%m/%Y"), border=1)
-        pdf.cell(20, 6, str(row["quantity"]), border=1)
-        pdf.cell(20, 6, vencido, border=1)
+        estoque_atual = int(row.get("quantity", 0))
+        qtd_vendida = int(row.get("sale", 0))
+        qtd_vencida = int(row.get("expired", 0))
+
+        pdf.cell(30, 6, str(row["ean"]), border=1)
+        pdf.cell(25, 6, str(row["batch"]), border=1)
+        pdf.cell(25, 6, expiry, border=1)
+        pdf.cell(20, 6, str(estoque_atual), border=1)
+        pdf.cell(25, 6, str(qtd_vendida), border=1)
+        pdf.cell(25, 6, str(qtd_vencida), border=1)
         pdf.ln(6)
 
-    # Exporta PDF em bytes
-    pdf_bytes = pdf.output(dest="S").encode("latin-1")
-    return pdf_bytes
+    return bytes(pdf.output(dest="S"))
 
 
-# =========================================
-# LOGIN
-# =========================================
-def pagina_login():
-    st.title("🔐 Login - Controle de Validade")
-
-    with st.form("login_form"):
-        usuario = st.text_input("Usuário")
-        senha = st.text_input("Senha", type="password")
-        submit = st.form_submit_button("Entrar")
-
-    if submit:
-        if usuario == USUARIO_PADRAO and senha == SENHA_PADRAO:
-            st.session_state["logged"] = True
-            st.success("Login realizado com sucesso!")
-        else:
-            st.error("Usuário ou senha inválidos.")
-
-
-def exigir_login():
-    if not st.session_state.get("logged", False):
-        st.warning("Você precisa estar logado para acessar esta página.")
-        pagina_login()
-        st.stop()
-
-
-# =========================================
-# PÁGINA 2: CADASTRO DE PRODUTOS
-# =========================================
 def pagina_cadastro():
     exigir_login()
-    st.title("📦 Cadastro de Produtos Perecíveis")
+    st.title("📦 Cadastro de Produtos")
 
-    st.markdown("#### Leitor de EAN com câmera (opcional)")
-    camera_file = st.camera_input("Aponte a câmera para o código de barras")
+    # estados para câmera / EAN lido
+    if "show_camera" not in st.session_state:
+        st.session_state["show_camera"] = False
+    if "ean_scanned" not in st.session_state:
+        st.session_state["ean_scanned"] = ""
 
-    scanned_ean = None
-    if camera_file is not None:
-        scanned_ean = read_barcode_from_image(camera_file)
-        if scanned_ean:
-            st.success(f"EAN lido: **{scanned_ean}**")
-        else:
-            st.warning("Não foi possível identificar o código de barras na imagem.")
+    scanned = None
+    camera_file = None
 
-    st.markdown("---")
-    st.markdown("#### Formulário de cadastro")
+    # =======================
+    # Botão para abrir / fechar câmera
+    # =======================
+    if st.session_state["show_camera"]:
+        st.info("Aponte a câmera para o código de barras e tire a foto.")
 
-    with st.form("form_cadastro"):
-        ean = st.text_input("EAN", value=scanned_ean if scanned_ean else "")
+        camera_file = st.camera_input("Escanear EAN", key="camera_ean")
+
+        if camera_file:
+            scanned = read_barcode_from_image(camera_file)
+            if scanned:
+                st.session_state["ean_scanned"] = scanned
+                st.success(f"EAN lido: {scanned}")
+            else:
+                st.warning("Não foi possível ler o código de barras. Tente novamente.")
+
+        if st.button("Fechar câmera"):
+            st.session_state["show_camera"] = False
+            st.rerun()
+    else:
+        if st.button("📷 Ler EAN com câmera"):
+            st.session_state["show_camera"] = True
+            st.rerun()
+
+    # =======================
+    # Formulário de cadastro
+    # =======================
+    with st.form("cad"):
+        ean = st.text_input("EAN", value=st.session_state.get("ean_scanned", ""))
         lote = st.text_input("Lote")
-        validade = st.date_input("Data de validade", value=date.today())
-        quantidade = st.number_input("Quantidade", min_value=0, value=0, step=1)
+        validade = st.date_input("Validade", value=date.today())
+        quantidade = st.number_input("Quantidade", min_value=1, step=1)
+        ok = st.form_submit_button("Salvar")
 
-        submitted = st.form_submit_button("Salvar produto")
+    if ok:
+        insert_product(ean, lote, validade, int(quantidade))
+        st.success("Produto salvo com sucesso!")
+        # limpa EAN para próximo cadastro
+        st.session_state["ean_scanned"] = ""
 
-    if submitted:
-        if not ean or not lote or quantidade <= 0:
-            st.error("Preencha EAN, Lote e uma quantidade maior que zero.")
-        else:
-            insert_product(
-                ean=ean,
-                batch=lote,
-                expiry=validade.isoformat(),
-                quantity=int(quantidade)
-            )
-            st.success("Produto cadastrado com sucesso!")
 
 
 # =========================================
-# PÁGINA 3: CONTROLE DE ESTOQUE
+# PÁGINA: CONTROLE DE ESTOQUE
 # =========================================
 def pagina_estoque():
     exigir_login()
+
     st.title("📊 Controle de Estoque")
+
+    # ⚠️ Verificar produtos vencidos
+    df_check = get_products()
+
+    if not df_check.empty:
+        df_check["expiry_date"] = pd.to_datetime(df_check["expiry"]).dt.date
+        hoje = date.today()
+
+        vencidos = df_check[(df_check["expiry_date"] < hoje) & (df_check["quantity"] > 0)]
+
+        if not vencidos.empty:
+            st.error(f"⚠️ Atenção: Existem **{len(vencidos)}** produtos vencidos ainda no estoque!")
+
 
     df = get_products()
     if df.empty:
-        st.info("Nenhum produto cadastrado ainda.")
+        st.info("Nenhum produto cadastrado.")
         return
 
-    st.write("Selecione um produto para editar a quantidade:")
+    # montar descrição bonita e evitar erro de concatenação
+    df["ean"] = df["ean"].astype(str)
+    df["batch"] = df["batch"].astype(str)
+    df["expiry_str"] = pd.to_datetime(df["expiry"]).dt.strftime("%d/%m/%Y")
+    df["desc"] = df["ean"] + " | Lote " + df["batch"] + " | Val " + df["expiry_str"]
 
-    df["descricao"] = df["ean"] + " | Lote " + df["batch"] + " | Validade " + df["expiry"]
-    escolha = st.selectbox("Produto", options=df["descricao"].tolist())
+    escolha = st.selectbox("Escolha o item", df["desc"])
 
-    produto = df[df["descricao"] == escolha].iloc[0]
-    prod_id = int(produto["id"])
-    estoque_atual = int(produto["quantity"])
+    p = df[df["desc"] == escolha].iloc[0]
+    prod_id = int(p["id"])
+    estoque_atual = int(p["quantity"])
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Estoque atual", estoque_atual)
-        st.write(f"EAN: **{produto['ean']}**")
-        st.write(f"Lote: **{produto['batch']}**")
-        st.write(f"Validade: **{produto['expiry']}**")
+    st.metric("Estoque atual", estoque_atual)
 
-    with col2:
-        nova_qtde = st.number_input(
-            "Nova quantidade em estoque",
-            min_value=0,
-            value=estoque_atual,
-            step=1
-        )
-        confirmar = st.button("Atualizar estoque")
+    nova = st.number_input("Nova quantidade", min_value=0, value=estoque_atual)
+    confirmar = st.button("Atualizar")
 
-    # Guardar info no session_state para usar no modal
-    if "pending_update" not in st.session_state:
-        st.session_state["pending_update"] = None
-    if "show_modal" not in st.session_state:
-        st.session_state["show_modal"] = False
-
+    # Passo 1: clicar em Atualizar define o que está "pendente"
     if confirmar:
-        nova_qtde = int(nova_qtde)
-        if nova_qtde == estoque_atual:
-            st.info("Quantidade não foi alterada.")
-        elif nova_qtde > estoque_atual:
+        nova = int(nova)
+        if nova == estoque_atual:
+            st.info("Nada mudou.")
+            st.session_state["show_modal"] = False
+            st.session_state["pending_update"] = None
+        elif nova > estoque_atual:
             # aumento de estoque (entrada simples)
-            diff = nova_qtde - estoque_atual
-            update_product_quantity(prod_id, nova_qtde, movement_type="in", diff_qty=diff)
-            st.success(f"Estoque aumentado em {diff} unidades (entrada).")
+            diff = nova - estoque_atual
+            update_product_quantity(prod_id, nova, "in", diff)
+            st.success(f"Entrada registrada (+{diff}).")
+            st.session_state["show_modal"] = False
+            st.session_state["pending_update"] = None
         else:
-            # diminuição: abrir modal para saber se é venda
-            diff = estoque_atual - nova_qtde
+            # diminuição → guarda info e mostra card de confirmação
+            diff = estoque_atual - nova
             st.session_state["pending_update"] = {
                 "product_id": prod_id,
                 "old": estoque_atual,
-                "new": nova_qtde,
-                "diff": diff
+                "new": nova,
+                "diff": diff,
             }
             st.session_state["show_modal"] = True
 
-    # Modal de confirmação de baixa
+    # Passo 2: card de confirmação de baixa
     if st.session_state.get("show_modal") and st.session_state.get("pending_update"):
         pending = st.session_state["pending_update"]
-        with st.modal("Confirmar baixa de estoque"):
-            st.write(f"Você está reduzindo o estoque de **{pending['old']}** para **{pending['new']}**.")
-            st.write(f"Quantidade a baixar: **{pending['diff']}**")
 
-            motivo = st.radio(
-                "Essa baixa foi por:",
-                options=["Venda", "Vencido / Descarte", "Outro ajuste"],
-                index=0
-            )
+        st.markdown("---")
+        st.markdown("### ⚠️ Confirmar baixa de estoque")
 
-            col_a, col_b = st.columns(2)
-            with col_a:
-                confirmar_modal = st.button("Confirmar baixa")
-            with col_b:
-                cancelar_modal = st.button("Cancelar")
+        st.write(f"**De:** {pending['old']}")
+        st.write(f"**Para:** {pending['new']}")
+        st.write(f"**Quantidade a baixar:** {pending['diff']}")
 
-            if confirmar_modal:
+        motivo = st.radio(
+            "Essa baixa foi por:",
+            ["Venda", "Vencido / Descarte", "Outro ajuste"],
+            index=0,
+            key="motivo_baixa",
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Confirmar baixa", key="btn_confirma_baixa"):
                 movement_type = "sale"
                 if motivo == "Vencido / Descarte":
                     movement_type = "expired"
@@ -357,107 +387,263 @@ def pagina_estoque():
                     movement_type = "adjust"
 
                 update_product_quantity(
-                    product_id=pending["product_id"],
-                    new_qty=pending["new"],
-                    movement_type=movement_type,
-                    diff_qty=pending["diff"]
+                    pending["product_id"],
+                    pending["new"],
+                    movement_type,
+                    pending["diff"],
                 )
-                st.success(f"Baixa de {pending['diff']} unidades registrada como '{motivo}'.")
-                st.session_state["show_modal"] = False
-                st.session_state["pending_update"] = None
 
-            if cancelar_modal:
+                st.success(
+                    f"Baixa de {pending['diff']} unidades registrada como **{motivo}**."
+                )
                 st.session_state["show_modal"] = False
                 st.session_state["pending_update"] = None
+                st.rerun()
+
+        with col2:
+            if st.button("❌ Cancelar", key="btn_cancela_baixa"):
+                st.session_state["show_modal"] = False
+                st.session_state["pending_update"] = None
+                st.info("Baixa cancelada.")
+                st.rerun()
+
 
 
 # =========================================
-# PÁGINA 4: RELATÓRIOS
+# PÁGINA: RELATÓRIOS
 # =========================================
 def pagina_relatorios():
     exigir_login()
-    st.title("📈 Relatórios de Estoque, Vendas e Vencidos")
+    st.title("📈 Relatórios")
 
-    df_produtos = get_products()
+    # Produtos e movimentos
+    df_prod = get_products()
     total_stock, total_sales, total_expired = calc_summary()
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Estoque atual", total_stock)
-    col2.metric("Quantidade vendida (acumulado)", total_sales)
-    col3.metric("Quantidade vencida em estoque", total_expired)
-
-    st.markdown("---")
-    st.subheader("Gráfico geral")
-
-    df_chart = pd.DataFrame({
-        "Categoria": ["Estoque atual", "Vendas", "Vencidos"],
-        "Quantidade": [total_stock, total_sales, total_expired]
-    })
-    st.bar_chart(df_chart, x="Categoria", y="Quantidade")
-
-    st.markdown("---")
-    st.subheader("Tabela detalhada")
-
-    if df_produtos.empty:
-        st.info("Nenhum produto cadastrado.")
+    if df_prod.empty:
+        st.info("Nenhum produto cadastrado ainda.")
         return
 
-    # Ajuste de colunas para exibição
-    df_exibir = df_produtos.copy()
-    df_exibir["expiry"] = pd.to_datetime(df_exibir["expiry"]).dt.strftime("%d/%m/%Y")
-    st.dataframe(df_exibir[["ean", "batch", "expiry", "quantity"]], use_container_width=True)
+    df_mov = get_movements()
 
-    # ====== EXPORTAÇÕES ======
-    st.markdown("### Exportar relatório")
+    # ===============================
+    # Montar DF consolidado por produto
+    # ===============================
+    if not df_mov.empty:
+        mov_agg = (
+            df_mov.groupby(["product_id", "movement_type"])["quantity"]
+            .sum()
+            .unstack(fill_value=0)
+            .reset_index()
+        )
+    else:
+        mov_agg = pd.DataFrame(columns=["product_id", "sale", "expired", "in", "adjust"])
 
-    # Excel
-    buffer_excel = io.BytesIO()
-    df_export = df_produtos.copy()
-    with pd.ExcelWriter(buffer_excel, engine="openpyxl") as writer:
-        df_export.to_excel(writer, index=False, sheet_name="Relatorio")
-    buffer_excel.seek(0)
-
-    st.download_button(
-        label="📥 Baixar Excel",
-        data=buffer_excel,
-        file_name="relatorio_validade.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    df_rel = df_prod.merge(
+        mov_agg,
+        left_on="id",
+        right_on="product_id",
+        how="left"
     )
 
-    # PDF
-    pdf_bytes = gerar_pdf_relatorio(df_produtos, total_stock, total_sales, total_expired)
-    st.download_button(
-        label="📄 Baixar PDF",
-        data=pdf_bytes,
-        file_name="relatorio_validade.pdf",
-        mime="application/pdf"
+    # Garantir colunas de movimento
+    for col in ["sale", "expired", "in", "adjust"]:
+        if col not in df_rel.columns:
+            df_rel[col] = 0
+
+    df_rel[["sale", "expired", "in", "adjust"]] = (
+        df_rel[["sale", "expired", "in", "adjust"]]
+        .fillna(0)
+        .astype(int)
     )
+    # -----------------------------
+    # CALCULAR VENCIDOS AUTOMÁTICOS
+    # -----------------------------
+    df_rel["expiry_date"] = pd.to_datetime(df_rel["expiry"]).dt.date
+    hoje = date.today()
+
+    df_rel["expired_auto"] = df_rel.apply(
+        lambda row: row["quantity"] if row["expiry_date"] < hoje else 0,
+        axis=1
+    )
+
+    # -----------------------------
+    # VENCIDO TOTAL = movimento + automático
+    # -----------------------------
+    df_rel["expired_total"] = df_rel["expired"] + df_rel["expired_auto"]
+
+    # ===============================
+    # Métricas gerais
+    # ===============================
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Estoque atual", total_stock)
+    col2.metric("Quantidade vendida", total_sales)
+    col3.metric("Quantidade vencida", total_expired)
+
+    # ===============================
+    # Gráfico de pizza (donut) profissional
+    # ===============================
+    df_graf = pd.DataFrame({
+        "Categoria": ["Estoque", "Vendas", "Vencidos"],
+        "Quantidade": [total_stock, total_sales, total_expired]
+    })
+
+    fig = px.pie(
+        df_graf,
+        values="Quantidade",
+        names="Categoria",
+        title="Distribuição Geral de Quantidades",
+        color="Categoria",
+        color_discrete_map={
+            "Estoque": "#1f77b4",
+            "Vendas": "#2ca02c",
+            "Vencidos": "#d62728",
+        },
+        hole=0.35
+    )
+
+    fig.update_traces(
+        textinfo="percent+label",
+        pull=[0.02, 0.02, 0.08],
+        marker=dict(line=dict(color="white", width=2))
+    )
+
+    fig.update_layout(
+        showlegend=True,
+        legend_title_text="Categorias",
+        title_x=0.5,
+        font=dict(size=14),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ===============================
+    # Tabela detalhada na tela (opcional)
+    # ===============================
+    st.markdown("### 📋 Detalhamento por produto")
+    df_tela = df_rel.copy()
+    df_tela["Validade"] = pd.to_datetime(df_tela["expiry"]).dt.strftime("%d/%m/%Y")
+
+    df_tela_view = df_rel[[
+    "ean",
+    "batch",
+    "expiry",
+    "quantity",
+    "sale",
+    "expired",
+    "expired_auto",
+    "expired_total"
+    ]]
+
+    df_tela_view.columns = [
+        "EAN",
+        "Lote",
+        "Validade",
+        "Em estoque",
+        "Vendida",
+        "Vencida (registrada)",
+        "Vencida em estoque",
+        "Vencida (total)"
+    ]
+
+    df_tela_view["Validade"] = pd.to_datetime(df_tela_view["Validade"]).dt.strftime("%d/%m/%Y")
+
+    st.dataframe(df_tela_view, use_container_width=True)
+
+
+    # ===============================
+    # Exportações
+    # ===============================
+    st.subheader("Exportar:")
+
+    # Excel em português
+    excel_buffer = io.BytesIO()
+    df_export = df_rel.copy()
+
+    # remover timezone de qualquer coluna datetime com tz
+    for col in df_export.select_dtypes(include=["datetimetz"]).columns:
+        df_export[col] = df_export[col].dt.tz_localize(None)
+
+    df_export["Validade"] = pd.to_datetime(df_export["expiry"]).dt.strftime("%d/%m/%Y")
+
+    df_excel = df_rel[[
+    "ean",
+    "batch",
+    "expiry",
+    "quantity",
+    "sale",
+    "expired",
+    "expired_auto",
+    "expired_total"
+    ]].rename(columns={
+        "ean": "EAN",
+        "batch": "Lote",
+        "expiry": "Validade",
+        "quantity": "Qtde em estoque",
+        "sale": "Qtde vendida",
+        "expired": "Qtde vencida (registrada)",
+        "expired_auto": "Qtde vencida em estoque",
+        "expired_total": "Qtde vencida (total)"
+    })
+
+    df_excel["Validade"] = pd.to_datetime(df_excel["Validade"]).dt.strftime("%d/%m/%Y")
+
+
+    df_excel.to_excel(excel_buffer, index=False, sheet_name="Relatório")
+    excel_buffer.seek(0)
+
+    st.download_button(
+        "📥 Baixar Excel (pt-BR)",
+        excel_buffer.getvalue(),
+        "relatorio_validade.xlsx"
+    )
+
+    # PDF com o DF consolidado
+    pdf_bytes = gerar_pdf_relatorio(df_rel, total_stock, total_sales, total_expired)
+    st.download_button("📄 Baixar PDF", pdf_bytes, "relatorio_validade.pdf")
+
 
 
 # =========================================
-# MAIN / NAVEGAÇÃO
+# MENU LATERAL / MAIN
 # =========================================
 def main():
-    init_db()
-
+    # Estados iniciais
     if "logged" not in st.session_state:
         st.session_state["logged"] = False
+    if "pending_update" not in st.session_state:
+        st.session_state["pending_update"] = None
+    if "show_modal" not in st.session_state:
+        st.session_state["show_modal"] = False
+    if "page" not in st.session_state:
+        st.session_state["page"] = "Login"
 
     st.sidebar.title("Menu")
+
+    if st.session_state.get("logged"):
+        st.sidebar.markdown(f"👤 Usuário: **{st.session_state['username']}**")
+
+    opcoes = ["Login", "Cadastro", "Estoque", "Relatórios"]
+
+    # Radio usa o valor atual de page como seleção padrão
     page = st.sidebar.radio(
-        "Navegação",
-        options=["Login", "Cadastro de Produtos", "Controle de Estoque", "Relatórios"]
+        "Ir para:",
+        opcoes,
+        index=opcoes.index(st.session_state["page"])
     )
 
+    # Atualiza o estado sempre que o usuário trocar no menu
+    st.session_state["page"] = page
+
+    # Roteamento das páginas
     if page == "Login":
         pagina_login()
-    elif page == "Cadastro de Produtos":
+    elif page == "Cadastro":
         pagina_cadastro()
-    elif page == "Controle de Estoque":
+    elif page == "Estoque":
         pagina_estoque()
-    elif page == "Relatórios":
+    else:
         pagina_relatorios()
 
-
 if __name__ == "__main__":
-    main()
+    main()        
