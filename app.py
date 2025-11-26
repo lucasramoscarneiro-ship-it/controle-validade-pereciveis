@@ -8,6 +8,42 @@ from fpdf import FPDF
 import io
 import plotly.express as px
 
+# =========================================
+# CONFIGURAÇÃO GLOBAL DA PÁGINA
+# =========================================
+st.set_page_config(
+    page_title="Controle de Validade",
+    page_icon="📦",
+    layout="wide",
+)
+
+def aplicar_estilo_profissional():
+    """
+    Esconde tudo de Streamlit/GitHub (menu, header, footer)
+    e ajusta o padding da página.
+    """
+    st.markdown(
+        """
+        <style>
+        /* Esconde menu "hambúrguer" do Streamlit */
+        #MainMenu {visibility: hidden;}
+
+        /* Esconde footer "Made with Streamlit" */
+        footer {visibility: hidden;}
+
+        /* Esconde o header padrão (onde aparecem logo e link do GitHub) */
+        header {visibility: hidden;}
+
+        /* Ajuste de padding do container principal */
+        .block-container {
+            padding-top: 1rem;
+            padding-bottom: 1rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 # =========================================
 # CONEXÃO COM SUPABASE POSTGRES
