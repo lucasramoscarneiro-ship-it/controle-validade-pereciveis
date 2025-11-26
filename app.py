@@ -719,30 +719,46 @@ def main():
     if "show_modal" not in st.session_state:
         st.session_state["show_modal"] = False
     if "page" not in st.session_state:
-        st.session_state["page"] = "Login"
+        st.session_state["page"] = "Cadastro"
 
-    # Sidebar
-    with st.sidebar:
-        st.markdown("## 📋 Navegação")
-        if st.session_state.get("logged"):
+    # Se não estiver logado, mostra só a tela de login (sem menu)
+    if not st.session_state["logged"]:
+        pagina_login()
+        return
+
+    # =========================
+    # BARRA SUPERIOR (TÍTULO + USUÁRIO)
+    # =========================
+    with st.container():
+        col1, col2 = st.columns([3, 1])
+        with col1:
             st.markdown(
-                f"👤 <b>Usuário:</b> {st.session_state['username']}",
+                "<h2 style='margin-bottom: 0.2rem;'>📦 Controle de Validade</h2>",
+                unsafe_allow_html=True,
+            )
+        with col2:
+            st.markdown(
+                f"<p style='text-align: right; margin-top: 0.6rem;'>👤 <b>{st.session_state['username']}</b></p>",
                 unsafe_allow_html=True,
             )
 
-        opcoes = ["Login", "Cadastro", "Estoque", "Relatórios"]
-
-        page = st.radio(
-            "Selecione a página:",
-            opcoes,
-            index=opcoes.index(st.session_state["page"]),
-        )
+    # =========================
+    # MENU SUPERIOR (RADIO HORIZONTAL)
+    # =========================
+    paginas = ["Cadastro", "Estoque", "Relatórios"]
+    page = st.radio(
+        "Navegação",
+        paginas,
+        horizontal=True,
+        index=paginas.index(st.session_state.get("page", "Cadastro")),
+    )
 
     st.session_state["page"] = page
 
-    if page == "Login":
-        pagina_login()
-    elif page == "Cadastro":
+    st.markdown("---")
+
+    # Roteamento
+    if page == "Cadastro":
         pagina_cadastro()
     elif page == "Estoque":
         pagina_estoque()
