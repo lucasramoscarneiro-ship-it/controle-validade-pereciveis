@@ -6,6 +6,7 @@ from PIL import Image
 from fpdf import FPDF
 import io
 import plotly.express as px
+import streamlit.components.v1 as components
 
 # =========================================
 # TENTAR IMPORTAR PYZBAR (LEITOR DE BARRAS)
@@ -27,48 +28,49 @@ st.set_page_config(
 )
 
 def aplicar_estilo_profissional():
+    # CSS básico (ainda ajuda a limpar o layout)
     st.markdown("""
     <style>
-
-    /* Remove o menu hambúrguer */
     #MainMenu {visibility: hidden !important;}
-
-    /* Remove footer "Made with Streamlit" */
     footer {visibility: hidden !important;}
-
-    /* Remove header (onde aparece GitHub / Streamlit) */
     header {visibility: hidden !important;}
+    [data-testid="stHeader"] {display: none !important;}
+    [data-testid="stToolbar"] {display: none !important;}
+    [data-testid="stDecoration"] {display: none !important;}
 
-    /* Esconde também divs internas do header */
-    [data-testid="stHeader"] {
-        display: none !important;
-    }
-
-    /* Remove a barra inferior do Streamlit Cloud */
-    [data-testid="stToolbar"] {
-        display: none !important;
-    }
-
-    /* Remove botão do GitHub e links extras */
-    [data-testid="stActionButton"] {
-        display: none !important;
-    }
-
-    /* Remove o botão de hover do GitHub no topo */
-    .stAppDeployButton {
-        display: none !important;
-    }
-
-    /* Ajustes gerais de layout */
     .block-container {
         padding-top: 1rem;
         padding-bottom: 1rem;
         padding-left: 1rem;
         padding-right: 1rem;
     }
-
     </style>
     """, unsafe_allow_html=True)
+
+    # JS agressivo: esconde qualquer coisa que tenha "streamlit" ou "github" no texto
+    components.html("""
+    <script>
+    function hideStreamlitBadges() {
+      const keywords = ['made with streamlit', 'streamlit', 'view source on github', 'github'];
+      const nodes = document.querySelectorAll('a, div, span, footer, button');
+
+      nodes.forEach(el => {
+        const txt = (el.innerText || '').toLowerCase().trim();
+        if (!txt) return;
+        if (keywords.some(k => txt.includes(k))) {
+          el.style.display = 'none';
+        }
+      });
+    }
+
+    // roda agora
+    hideStreamlitBadges();
+    // e continua rodando a cada 1,5s (caso o Streamlit recrie o footer)
+    setInterval(hideStreamlitBadges, 1500);
+    </script>
+    """, height=0)
+
+
 
 
 # =========================================
