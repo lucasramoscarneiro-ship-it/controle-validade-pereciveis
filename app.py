@@ -3,10 +3,19 @@ import psycopg
 import pandas as pd
 from datetime import datetime, date
 from PIL import Image
-from pyzbar.pyzbar import decode
 from fpdf import FPDF
 import io
 import plotly.express as px
+
+# =========================================
+# TENTAR IMPORTAR PYZBAR (LEITOR DE BARRAS)
+# =========================================
+try:
+    from pyzbar.pyzbar import decode
+    BARCODE_ENABLED = True
+except Exception:
+    # No Streamlit Cloud, geralmente cai aqui
+    BARCODE_ENABLED = False
 
 # =========================================
 # CONFIGURAÇÃO GLOBAL DA PÁGINA
@@ -19,8 +28,8 @@ st.set_page_config(
 
 def aplicar_estilo_profissional():
     """
-    Esconde tudo de Streamlit/GitHub (menu, header, footer)
-    e ajusta o padding da página.
+    Esconde tudo de Streamlit (menu, header, footer)
+    e ajusta o layout para ficar mais profissional e bom no celular.
     """
     st.markdown(
         """
@@ -31,19 +40,37 @@ def aplicar_estilo_profissional():
         /* Esconde footer "Made with Streamlit" */
         footer {visibility: hidden;}
 
-        /* Esconde o header padrão (onde aparecem logo e link do GitHub) */
+        /* Esconde o header padrão (logo, etc.) */
         header {visibility: hidden;}
 
         /* Ajuste de padding do container principal */
         .block-container {
-            padding-top: 1rem;
-            padding-bottom: 1rem;
+            padding-top: 0.8rem;
+            padding-bottom: 0.8rem;
+            padding-left: 1rem;
+            padding-right: 1rem;
+        }
+
+        /* Deixar botões mais amigáveis no mobile */
+        button[kind="primary"], button[kind="secondary"] {
+            min-width: 100%;
+        }
+
+        @media (max-width: 768px) {
+            .block-container {
+                padding-top: 0.5rem;
+                padding-bottom: 0.5rem;
+                padding-left: 0.5rem;
+                padding-right: 0.5rem;
+            }
+            .stMetric {
+                text-align: center;
+            }
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
-
 
 # =========================================
 # CONEXÃO COM SUPABASE POSTGRES
@@ -65,15 +92,19 @@ def get_conn():
 def validate_login(username, password):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         SELECT id, username
         FROM validate_user(%s, %s)
-    """, (username, password))
-    
+        """,
+        (username, password),
+    )
+
     result = cur.fetchone()
     cur.close()
     conn.close()
     return result
+
 
 def pagina_login():
     st.title("🔐 Login")
@@ -111,19 +142,25 @@ def insert_product(ean, batch, expiry, quantity):
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("""
+    cur.execute(
+        """
         INSERT INTO products (ean, batch, expiry, quantity)
         VALUES (%s, %s, %s, %s)
         RETURNING id;
-    """, (ean, batch, expiry, quantity))
+        """,
+        (ean, batch, expiry, quantity),
+    )
 
     product_id = cur.fetchone()[0]
 
     # movimento de entrada
-    cur.execute("""
+    cur.execute(
+        """
         INSERT INTO movements (product_id, movement_type, quantity)
         VALUES (%s, 'in', %s)
-    """, (product_id, quantity))
+        """,
+        (product_id, quantity),
+    )
 
     conn.commit()
     cur.close()
@@ -142,17 +179,23 @@ def update_product_quantity(product_id, new_qty, movement_type=None, diff_qty=0)
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("""
+    cur.execute(
+        """
         UPDATE products
         SET quantity = %s
         WHERE id = %s
-    """, (new_qty, product_id))
+        """,
+        (new_qty, product_id),
+    )
 
     if movement_type and diff_qty > 0:
-        cur.execute("""
+        cur.execute(
+            """
             INSERT INTO movements (product_id, movement_type, quantity)
             VALUES (%s, %s, %s)
-        """, (product_id, movement_type, diff_qty))
+            """,
+            (product_id, movement_type, diff_qty),
+        )
 
     conn.commit()
     cur.close()
@@ -183,8 +226,8 @@ def calc_summary():
         )
 
     # -------- VENCIDOS --------
-    expired_by_movements = 0   # já baixados como vencidos
-    expired_in_stock = 0       # ainda no estoque, mas com data vencida
+    expired_by_movements = 0  # já baixados como vencidos
+    expired_in_stock = 0  # ainda no estoque, mas com data vencida
 
     if not movements.empty:
         expired_by_movements = int(
@@ -204,12 +247,14 @@ def calc_summary():
 
     return total_stock, total_sales, total_expired
 
-
-
 # =========================================
-# LEITURA DE CÓDIGO DE BARRAS
+# LEITURA DE CÓDIGO DE BARRAS (OPCIONAL)
 # =========================================
 def read_barcode_from_image(image_file):
+    # No Streamlit Cloud, BARCODE_ENABLED será False → sempre retorna None
+    if not BARCODE_ENABLED:
+        return None
+
     img = Image.open(image_file)
     decoded = decode(img)
     if decoded:
@@ -272,6 +317,9 @@ def gerar_pdf_relatorio(df_produtos, total_stock, total_sales, total_expired):
     return bytes(pdf.output(dest="S"))
 
 
+# =========================================
+# PÁGINA: CADASTRO
+# =========================================
 def pagina_cadastro():
     exigir_login()
     st.title("📦 Cadastro de Produtos")
@@ -288,32 +336,43 @@ def pagina_cadastro():
     # =======================
     # Botão para abrir / fechar câmera
     # =======================
-    if st.session_state["show_camera"]:
-        st.info("Aponte a câmera para o código de barras e tire a foto.")
+    if BARCODE_ENABLED:
+        if st.session_state["show_camera"]:
+            st.info("Aponte a câmera para o código de barras e tire a foto.")
 
-        camera_file = st.camera_input("Escanear EAN", key="camera_ean")
+            camera_file = st.camera_input("Escanear EAN", key="camera_ean")
 
-        if camera_file:
-            scanned = read_barcode_from_image(camera_file)
-            if scanned:
-                st.session_state["ean_scanned"] = scanned
-                st.success(f"EAN lido: {scanned}")
-            else:
-                st.warning("Não foi possível ler o código de barras. Tente novamente.")
+            if camera_file:
+                scanned = read_barcode_from_image(camera_file)
+                if scanned:
+                    st.session_state["ean_scanned"] = scanned
+                    st.success(f"EAN lido: {scanned}")
+                else:
+                    st.warning("Não foi possível ler o código de barras. Tente novamente.")
 
-        if st.button("Fechar câmera"):
-            st.session_state["show_camera"] = False
-            st.rerun()
+            if st.button("Fechar câmera"):
+                st.session_state["show_camera"] = False
+                st.rerun()
+        else:
+            if st.button("📷 Ler EAN com câmera"):
+                st.session_state["show_camera"] = True
+                st.rerun()
     else:
-        if st.button("📷 Ler EAN com câmera"):
-            st.session_state["show_camera"] = True
-            st.rerun()
+        # Ambiente onde pyzbar não funciona (ex.: Streamlit Cloud)
+        st.info(
+            "🔎 Leitura de código de barras via câmera não está disponível neste servidor.\n\n"
+            "Use o campo de EAN abaixo para digitar o código (no celular o teclado numérico facilita)."
+        )
 
     # =======================
     # Formulário de cadastro
     # =======================
     with st.form("cad"):
-        ean = st.text_input("EAN", value=st.session_state.get("ean_scanned", ""))
+        ean = st.text_input(
+            "EAN",
+            value=st.session_state.get("ean_scanned", ""),
+            help="Digite ou cole o código de barras.",
+        )
         lote = st.text_input("Lote")
         validade = st.date_input("Validade", value=date.today())
         quantidade = st.number_input("Quantidade", min_value=1, step=1)
@@ -324,7 +383,6 @@ def pagina_cadastro():
         st.success("Produto salvo com sucesso!")
         # limpa EAN para próximo cadastro
         st.session_state["ean_scanned"] = ""
-
 
 
 # =========================================
@@ -342,18 +400,21 @@ def pagina_estoque():
         df_check["expiry_date"] = pd.to_datetime(df_check["expiry"]).dt.date
         hoje = date.today()
 
-        vencidos = df_check[(df_check["expiry_date"] < hoje) & (df_check["quantity"] > 0)]
+        vencidos = df_check[
+            (df_check["expiry_date"] < hoje) & (df_check["quantity"] > 0)
+        ]
 
         if not vencidos.empty:
-            st.error(f"⚠️ Atenção: Existem **{len(vencidos)}** produtos vencidos ainda no estoque!")
-
+            st.error(
+                f"⚠️ Atenção: Existem **{len(vencidos)}** produtos vencidos ainda no estoque!"
+            )
 
     df = get_products()
     if df.empty:
         st.info("Nenhum produto cadastrado.")
         return
 
-    # montar descrição bonita e evitar erro de concatenação
+    # montar descrição bonita
     df["ean"] = df["ean"].astype(str)
     df["batch"] = df["batch"].astype(str)
     df["expiry_str"] = pd.to_datetime(df["expiry"]).dt.strftime("%d/%m/%Y")
@@ -444,7 +505,6 @@ def pagina_estoque():
                 st.rerun()
 
 
-
 # =========================================
 # PÁGINA: RELATÓRIOS
 # =========================================
@@ -473,13 +533,12 @@ def pagina_relatorios():
             .reset_index()
         )
     else:
-        mov_agg = pd.DataFrame(columns=["product_id", "sale", "expired", "in", "adjust"])
+        mov_agg = pd.DataFrame(
+            columns=["product_id", "sale", "expired", "in", "adjust"]
+        )
 
     df_rel = df_prod.merge(
-        mov_agg,
-        left_on="id",
-        right_on="product_id",
-        how="left"
+        mov_agg, left_on="id", right_on="product_id", how="left"
     )
 
     # Garantir colunas de movimento
@@ -488,9 +547,7 @@ def pagina_relatorios():
             df_rel[col] = 0
 
     df_rel[["sale", "expired", "in", "adjust"]] = (
-        df_rel[["sale", "expired", "in", "adjust"]]
-        .fillna(0)
-        .astype(int)
+        df_rel[["sale", "expired", "in", "adjust"]].fillna(0).astype(int)
     )
     # -----------------------------
     # CALCULAR VENCIDOS AUTOMÁTICOS
@@ -500,7 +557,7 @@ def pagina_relatorios():
 
     df_rel["expired_auto"] = df_rel.apply(
         lambda row: row["quantity"] if row["expiry_date"] < hoje else 0,
-        axis=1
+        axis=1,
     )
 
     # -----------------------------
@@ -517,12 +574,14 @@ def pagina_relatorios():
     col3.metric("Quantidade vencida", total_expired)
 
     # ===============================
-    # Gráfico de pizza (donut) profissional
+    # Gráfico de pizza (donut)
     # ===============================
-    df_graf = pd.DataFrame({
-        "Categoria": ["Estoque", "Vendas", "Vencidos"],
-        "Quantidade": [total_stock, total_sales, total_expired]
-    })
+    df_graf = pd.DataFrame(
+        {
+            "Categoria": ["Estoque", "Vendas", "Vencidos"],
+            "Quantidade": [total_stock, total_sales, total_expired],
+        }
+    )
 
     fig = px.pie(
         df_graf,
@@ -535,13 +594,13 @@ def pagina_relatorios():
             "Vendas": "#2ca02c",
             "Vencidos": "#d62728",
         },
-        hole=0.35
+        hole=0.35,
     )
 
     fig.update_traces(
         textinfo="percent+label",
         pull=[0.02, 0.02, 0.08],
-        marker=dict(line=dict(color="white", width=2))
+        marker=dict(line=dict(color="white", width=2)),
     )
 
     fig.update_layout(
@@ -554,22 +613,21 @@ def pagina_relatorios():
     st.plotly_chart(fig, use_container_width=True)
 
     # ===============================
-    # Tabela detalhada na tela (opcional)
+    # Tabela detalhada
     # ===============================
     st.markdown("### 📋 Detalhamento por produto")
-    df_tela = df_rel.copy()
-    df_tela["Validade"] = pd.to_datetime(df_tela["expiry"]).dt.strftime("%d/%m/%Y")
-
-    df_tela_view = df_rel[[
-    "ean",
-    "batch",
-    "expiry",
-    "quantity",
-    "sale",
-    "expired",
-    "expired_auto",
-    "expired_total"
-    ]]
+    df_tela_view = df_rel[
+        [
+            "ean",
+            "batch",
+            "expiry",
+            "quantity",
+            "sale",
+            "expired",
+            "expired_auto",
+            "expired_total",
+        ]
+    ]
 
     df_tela_view.columns = [
         "EAN",
@@ -579,13 +637,14 @@ def pagina_relatorios():
         "Vendida",
         "Vencida (registrada)",
         "Vencida em estoque",
-        "Vencida (total)"
+        "Vencida (total)",
     ]
 
-    df_tela_view["Validade"] = pd.to_datetime(df_tela_view["Validade"]).dt.strftime("%d/%m/%Y")
+    df_tela_view["Validade"] = pd.to_datetime(
+        df_tela_view["Validade"]
+    ).dt.strftime("%d/%m/%Y")
 
     st.dataframe(df_tela_view, use_container_width=True)
-
 
     # ===============================
     # Exportações
@@ -600,30 +659,37 @@ def pagina_relatorios():
     for col in df_export.select_dtypes(include=["datetimetz"]).columns:
         df_export[col] = df_export[col].dt.tz_localize(None)
 
-    df_export["Validade"] = pd.to_datetime(df_export["expiry"]).dt.strftime("%d/%m/%Y")
+    df_export["Validade"] = pd.to_datetime(df_export["expiry"]).dt.strftime(
+        "%d/%m/%Y"
+    )
 
-    df_excel = df_rel[[
-    "ean",
-    "batch",
-    "expiry",
-    "quantity",
-    "sale",
-    "expired",
-    "expired_auto",
-    "expired_total"
-    ]].rename(columns={
-        "ean": "EAN",
-        "batch": "Lote",
-        "expiry": "Validade",
-        "quantity": "Qtde em estoque",
-        "sale": "Qtde vendida",
-        "expired": "Qtde vencida (registrada)",
-        "expired_auto": "Qtde vencida em estoque",
-        "expired_total": "Qtde vencida (total)"
-    })
+    df_excel = df_rel[
+        [
+            "ean",
+            "batch",
+            "expiry",
+            "quantity",
+            "sale",
+            "expired",
+            "expired_auto",
+            "expired_total",
+        ]
+    ].rename(
+        columns={
+            "ean": "EAN",
+            "batch": "Lote",
+            "expiry": "Validade",
+            "quantity": "Qtde em estoque",
+            "sale": "Qtde vendida",
+            "expired": "Qtde vencida (registrada)",
+            "expired_auto": "Qtde vencida em estoque",
+            "expired_total": "Qtde vencida (total)",
+        }
+    )
 
-    df_excel["Validade"] = pd.to_datetime(df_excel["Validade"]).dt.strftime("%d/%m/%Y")
-
+    df_excel["Validade"] = pd.to_datetime(
+        df_excel["Validade"]
+    ).dt.strftime("%d/%m/%Y")
 
     df_excel.to_excel(excel_buffer, index=False, sheet_name="Relatório")
     excel_buffer.seek(0)
@@ -631,19 +697,20 @@ def pagina_relatorios():
     st.download_button(
         "📥 Baixar Excel (pt-BR)",
         excel_buffer.getvalue(),
-        "relatorio_validade.xlsx"
+        "relatorio_validade.xlsx",
     )
 
-    # PDF com o DF consolidado
+    # PDF
     pdf_bytes = gerar_pdf_relatorio(df_rel, total_stock, total_sales, total_expired)
     st.download_button("📄 Baixar PDF", pdf_bytes, "relatorio_validade.pdf")
 
 
-
 # =========================================
-# MENU LATERAL / MAIN
+# MENU / MAIN
 # =========================================
 def main():
+    aplicar_estilo_profissional()
+
     # Estados iniciais
     if "logged" not in st.session_state:
         st.session_state["logged"] = False
@@ -654,24 +721,25 @@ def main():
     if "page" not in st.session_state:
         st.session_state["page"] = "Login"
 
-    st.sidebar.title("Menu")
+    # Sidebar
+    with st.sidebar:
+        st.markdown("## 📋 Navegação")
+        if st.session_state.get("logged"):
+            st.markdown(
+                f"👤 <b>Usuário:</b> {st.session_state['username']}",
+                unsafe_allow_html=True,
+            )
 
-    if st.session_state.get("logged"):
-        st.sidebar.markdown(f"👤 Usuário: **{st.session_state['username']}**")
+        opcoes = ["Login", "Cadastro", "Estoque", "Relatórios"]
 
-    opcoes = ["Login", "Cadastro", "Estoque", "Relatórios"]
+        page = st.radio(
+            "Selecione a página:",
+            opcoes,
+            index=opcoes.index(st.session_state["page"]),
+        )
 
-    # Radio usa o valor atual de page como seleção padrão
-    page = st.sidebar.radio(
-        "Ir para:",
-        opcoes,
-        index=opcoes.index(st.session_state["page"])
-    )
-
-    # Atualiza o estado sempre que o usuário trocar no menu
     st.session_state["page"] = page
 
-    # Roteamento das páginas
     if page == "Login":
         pagina_login()
     elif page == "Cadastro":
@@ -681,5 +749,6 @@ def main():
     else:
         pagina_relatorios()
 
+
 if __name__ == "__main__":
-    main()        
+    main()
